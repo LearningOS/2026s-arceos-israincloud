@@ -14,7 +14,15 @@ qemu_args-x86_64 := \
   -machine q35 \
   -kernel $(OUT_ELF)
 
+QEMU_VERSION_MAJOR := $(shell qemu-system-riscv64 --version 2>/dev/null | sed -nE 's/.*version ([0-9]+).*/\1/p' | head -1)
+ifeq ($(shell [ "$(QEMU_VERSION_MAJOR)" -ge 7 ] 2>/dev/null && echo y),y)
+  RISCV_HEXT_PROP := h=true
+else
+  RISCV_HEXT_PROP := x-h=true
+endif
+
 qemu_args-riscv64 := \
+  -cpu rv64,$(RISCV_HEXT_PROP) \
   -machine virt \
   -bios default \
   -kernel $(OUT_BIN)

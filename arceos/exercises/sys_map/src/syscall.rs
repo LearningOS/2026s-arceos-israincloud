@@ -7,6 +7,8 @@ use axerrno::LinuxError;
 use axtask::current;
 use axtask::TaskExtRef;
 use axhal::paging::MappingFlags;
+use axhal::mem::VirtAddr;
+use memory_addr::{MemoryAddr, VirtAddrRange, PAGE_SIZE_4K};
 use arceos_posix_api as api;
 
 const SYS_IOCTL: usize = 29;
@@ -131,7 +133,6 @@ fn handle_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
     ret
 }
 
-#[allow(unused_variables)]
 fn sys_mmap(
     addr: *mut usize,
     length: usize,
@@ -140,7 +141,60 @@ fn sys_mmap(
     fd: i32,
     _offset: isize,
 ) -> isize {
-    unimplemented!("no sys_mmap!");
+    let curr = current();
+    let mut uspace = curr.task_ext().aspace.lock();
+
+    let prot = MmapProt::from_bits_truncate(prot);
+    let flags = MmapFlags::from_bits_truncate(flags);
+    let map_flags: MappingFlags = prot.into();
+
+    // Round length up to whole pages.
+    let length = (length + PAGE_SIZE_4K - 1) & !(PAGE_SIZE_4K - 1);
+    if length == 0 {
+        return -LinuxError::EINVAL.code() as isize;
+    }
+
+    // Pick the target virtual address.
+    let hint = VirtAddr::from_usize(addr as usize).align_down_4k();
+    let limit = VirtAddrRange::new(uspace.base(), uspace.end());
+    let start = if flags.contains(MmapFlags::MAP_FIXED) && !addr.is_null() {
+        hint
+    } else {
+        let search_hint = if addr.is_null() { uspace.base() } else { hint };
+        match uspace.find_free_area(search_hint, length, limit) {
+            Some(va) => va,
+            None => return -LinuxError::ENOMEM.code() as isize,
+        }
+    };
+
+    if let Err(e) = uspace.map_alloc(start, length, map_flags, true) {
+        ax_println!("sys_mmap: map_alloc failed: {:?}", e);
+        return -LinuxError::ENOMEM.code() as isize;
+    }
+
+    // If a real file is backing the mapping, copy its contents into the new region.
+    // The user VA isn't reachable via the kernel page table, so translate it into the
+    // kernel direct-map view (per page) before reading the file into it.
+    if !flags.contains(MmapFlags::MAP_ANONYMOUS) && fd >= 0 {
+        if let Some(chunks) = uspace.translated_byte_buffer(start, length) {
+            'outer: for chunk in chunks {
+                let mut total = 0;
+                while total < chunk.len() {
+                    let n = api::sys_read(
+                        fd,
+                        unsafe { chunk.as_mut_ptr().add(total) } as *mut c_void,
+                        chunk.len() - total,
+                    );
+                    if n <= 0 {
+                        break 'outer;
+                    }
+                    total += n as usize;
+                }
+            }
+        }
+    }
+
+    start.as_usize() as isize
 }
 
 fn sys_openat(dfd: c_int, fname: *const c_char, flags: c_int, mode: api::ctypes::mode_t) -> isize {
